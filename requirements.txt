@@ -1,0 +1,7 @@
+# Dhan Trader — direct dependencies
+# (dhanhq transitively pulls in websockets, requests, pandas, etc.)
+
+dhanhq>=2.2.0,<3.0.0      # official DhanHQ Python SDK (v2 API: DhanContext + MarketFeed)
+python-dotenv>=1.0.0      # load credentials from .env
+truststore>=0.9          # verify TLS against the OS cert store (corporate proxy CA)
+pyyaml>=6.0              # parse instruments.yaml (instrument/feed config)

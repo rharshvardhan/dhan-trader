@@ -1,0 +1,15 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Secrets — never commit credentials
+.env
+
+# Logs
+logs/
+*.log
