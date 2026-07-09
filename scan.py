@@ -10,7 +10,10 @@ engine (strategy/range_breakout.py) on that day, and prints one row per stock:
     SETUP (T1/T2/NO), DIRECTION, ENTRY price, and the marked range MH / ML
     (range high / low) with its height in points.
 
-Detection only - no orders, no SL/target. Needs the Data plan + .env creds.
+Detection + Target 1: the engine runs on the searched leg AND its counterpart
+(future<->underlying stock). Target 1 = min(both opening ranges)/2, taken ONLY
+when BOTH legs are T1 in the SAME direction; otherwise the setup is HOLD. No
+orders placed, no stop-loss yet. Needs the Data plan + .env creds.
 Self-contained: depends only on config.py + strategy/ (no other script).
 
 Run:  .venv/Scripts/python.exe scan.py
@@ -48,6 +51,7 @@ SCRIP_MASTER_MAX_AGE_DAYS = 7
 LOOKBACK_DAYS = 7        # small window; we only use the latest trading day in it
 INTERVAL_MIN = 5
 REQUEST_GAP_SEC = 0.3    # gentle spacing between per-stock history calls
+TARGET_STEP = 5.0        # T2/T3 ladder: each extends the target by 5 more points
 
 SEG_INT_TO_STR = {
     MarketFeed.IDX: "IDX_I",
@@ -86,6 +90,82 @@ def resample(rows, interval_min: int):
     if bucket is not None:
         out.append(Candle(bucket, bucket + delta, o, h, l, c))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Target 1 (needs BOTH legs):
+#   Run the Range Breakout engine on the future AND on its underlying stock.
+#   A target is taken ONLY when BOTH legs are T1 and point the SAME direction.
+#   Then T1 distance = min(future range, stock range) / 2, applied from the
+#   future's entry by direction. Any disagreement -> HOLD (no target).
+# ---------------------------------------------------------------------------
+def counterpart_of(symbol: str, segment: int, eq_mapping: dict, fut_map: dict):
+    """Return the opposite leg used for Target 1, or None.
+
+    future  -> its underlying cash equity.
+    equity  -> its nearest not-yet-expired future.
+    Returns (symbol, security_id, segment, instrument_type) or None."""
+    if segment == MarketFeed.NSE_FNO:            # future -> underlying equity
+        underlying = symbol.split("-")[0]
+        sid = eq_mapping.get(underlying)
+        return (underlying, sid, MarketFeed.NSE, "EQUITY") if sid else None
+    if segment == MarketFeed.NSE:                # equity -> nearest future
+        contracts = fut_map.get(symbol.upper())
+        if not contracts:
+            return None
+        today = datetime.now(IST).date()
+        picks = [c for c in contracts if c[0] >= today] or contracts
+        _exp, tsym, sid, iname = picks[0]
+        return (tsym, sid, MarketFeed.NSE_FNO, iname)
+    return None
+
+
+def _verdict(strat) -> str:
+    """Map an engine result to a verdict string.
+
+    T1 / T2 (with '*' when the breakout is confirmed but the entry candle has not
+    formed yet), PENDING (range not marked), NO TRADE, or '-' when there is no data."""
+    if strat is None:
+        return "-"
+    if strat.setup and strat.entry_price is not None:
+        return strat.setup
+    if strat.setup and strat.state in (State.AWAIT_ENTRY, State.AWAIT_T2_ENTRY):
+        return strat.setup + "*"
+    if strat.mh is None:
+        return "PENDING"
+    return "NO TRADE"
+
+
+def run_day_strategy(dhan, symbol, security_id, segment, instrument_type):
+    """Fetch the latest trading day's candles and run the engine on it.
+
+    Returns (day, strat) or (None, None) when there is no data."""
+    inst = Instrument(symbol, security_id, segment)
+    to_d = date.today()
+    from_d = to_d - timedelta(days=LOOKBACK_DAYS)
+    rows = load_dhan(dhan, inst,
+                     f"{from_d.isoformat()} 09:15:00",
+                     f"{to_d.isoformat()} 15:30:00", INTERVAL_MIN, instrument_type)
+    if not rows:
+        return None, None
+    candles = resample(rows, INTERVAL_MIN)
+    by_day = defaultdict(list)
+    for cd in candles:
+        by_day[cd.start.date()].append(cd)
+    if not by_day:
+        return None, None
+    day = max(by_day)
+    strat = RangeBreakout(symbol, interval_min=INTERVAL_MIN)
+    for cd in by_day[day]:
+        strat.on_candle(cd)
+    return day, strat
+
+
+def _range_of(strat):
+    """Opening-range height (MH-ML) of an engine result, or None."""
+    if strat is None or strat.mh is None or strat.ml is None:
+        return None
+    return strat.mh - strat.ml
 
 
 # ---------------------------------------------------------------------------
@@ -234,38 +314,65 @@ def resolve(symbol: str, eq_mapping: dict, fut_map: dict):
 # Per-stock scan of the latest trading day
 # ---------------------------------------------------------------------------
 def scan_latest(symbol: str, security_id: str, segment: int,
-                instrument_type: str, dhan):
-    """Return a result dict for the latest trading day, or None if no data."""
-    inst = Instrument(symbol, security_id, segment)
-    to_d = date.today()
-    from_d = to_d - timedelta(days=LOOKBACK_DAYS)
-    rows = load_dhan(dhan, inst,
-                     f"{from_d.isoformat()} 09:15:00",
-                     f"{to_d.isoformat()} 15:30:00", INTERVAL_MIN,
-                     instrument_type)
-    if not rows:
+                instrument_type: str, dhan, eq_mapping: dict, fut_map: dict):
+    """Return a result dict for the latest trading day, or None if no data.
+
+    Runs the engine on the searched leg AND on its counterpart (future<->stock).
+    A Target 1 is produced only when BOTH legs are T1 and share the same
+    direction; otherwise a T1 on the searched leg is downgraded to HOLD."""
+    day, strat = run_day_strategy(dhan, symbol, security_id, segment, instrument_type)
+    if strat is None:
         return None
 
-    candles = resample(rows, INTERVAL_MIN)
-    by_day = defaultdict(list)
-    for cd in candles:
-        by_day[cd.start.date()].append(cd)
-    if not by_day:
-        return None
+    verdict = _verdict(strat)
+    own_range = _range_of(strat)
 
-    day = max(by_day)
-    strat = RangeBreakout(symbol, interval_min=INTERVAL_MIN)
-    for cd in by_day[day]:
-        strat.on_candle(cd)
+    # ---- Run the counterpart leg (future <-> underlying stock) ----
+    cp_strat = None
+    cp_setup, cp_range = "-", None
+    cp = counterpart_of(symbol, segment, eq_mapping, fut_map)
+    if cp is not None:
+        try:
+            time.sleep(REQUEST_GAP_SEC)      # gentle spacing for the extra call
+            _cp_day, cp_strat = run_day_strategy(dhan, cp[0], cp[1], cp[2], cp[3])
+            cp_setup = _verdict(cp_strat)
+            cp_range = _range_of(cp_strat)
+        except Exception:
+            cp_strat, cp_setup, cp_range = None, "-", None   # counterpart unavailable
 
-    if strat.setup and strat.entry_price is not None:
-        verdict = strat.setup
-    elif strat.setup and strat.state == State.AWAIT_ENTRY:
-        verdict = strat.setup + "*"          # breakout seen, entry candle not formed yet
-    elif strat.mh is None:
-        verdict = "PENDING"                  # range not marked yet (before ~09:55)
-    else:
-        verdict = "NO TRADE"
+    # ---- Target 1 gate: BOTH legs T1 AND same direction ----
+    t1_dist = t1_price = None
+    if strat.setup == "T1":
+        both_t1 = cp_strat is not None and cp_strat.setup == "T1"
+        same_dir = (both_t1 and strat.direction
+                    and cp_strat.direction == strat.direction)
+        if both_t1 and same_dir and own_range is not None and cp_range is not None:
+            t1_dist = min(own_range, cp_range) / 2.0
+            if strat.entry_price is not None:
+                if strat.direction.startswith("BUY"):
+                    t1_price = strat.entry_price + t1_dist
+                elif strat.direction.startswith("SELL"):
+                    t1_price = strat.entry_price - t1_dist
+        else:
+            verdict = "HOLD"                  # T1 not confirmed by the other leg
+
+    # ---- T2/T3 ladder: only after a valid T1, and only while price keeps
+    #      running in the trade direction. Each rung adds TARGET_STEP points.
+    #      If price does not push past T1, T2 is unset -> T3 unset too. ----
+    t2_price = t3_price = None
+    if t1_price is not None:
+        if strat.direction.startswith("SELL"):
+            ext = strat.post_low             # lowest low reached after entry
+            if ext is not None and ext <= t1_price:      # still moving down past T1
+                t2_price = t1_price - TARGET_STEP
+                if ext <= t2_price:                      # still moving down past T2
+                    t3_price = t2_price - TARGET_STEP
+        elif strat.direction.startswith("BUY"):
+            ext = strat.post_high            # highest high reached after entry
+            if ext is not None and ext >= t1_price:      # still moving up past T1
+                t2_price = t1_price + TARGET_STEP
+                if ext >= t2_price:                      # still moving up past T2
+                    t3_price = t2_price + TARGET_STEP
 
     return {
         "day": day,
@@ -274,6 +381,13 @@ def scan_latest(symbol: str, security_id: str, segment: int,
         "entry": strat.entry_price,
         "mh": strat.mh,
         "ml": strat.ml,
+        "own_range": own_range,
+        "cp_setup": cp_setup,
+        "cp_range": cp_range,
+        "t1_dist": t1_dist,
+        "t1_price": t1_price,
+        "t2_price": t2_price,
+        "t3_price": t3_price,
     }
 
 
@@ -315,7 +429,8 @@ def main() -> int:
         matched = match["symbol"]
         try:
             res = scan_latest(matched, match["security_id"],
-                              match["segment"], match["instrument_type"], dhan)
+                              match["segment"], match["instrument_type"], dhan,
+                              eq_mapping, fut_map)
         except Exception as exc:
             rows_out.append((matched, None, f"ERROR: {exc}"))
             continue
@@ -326,13 +441,14 @@ def main() -> int:
     # ---- Print the table ----
     day_seen = next((r["day"] for _, r, err in rows_out if r), None)
     print()
-    print("=" * 88)
+    print("=" * 138)
     print("RANGE BREAKOUT SCAN  "
           + (f"(latest day: {day_seen.isoformat()})" if day_seen else "(no data)"))
-    print("=" * 88)
+    print("=" * 138)
     print(f"  {'SYMBOL':<22} {'SETUP':<9} {'DIRECTION':<13} {'ENTRY':>9} "
-          f"{'MH':>9} {'ML':>9} {'RANGE':>8}")
-    print("  " + "-" * 84)
+          f"{'MH':>9} {'ML':>9} {'RANGE':>8} {'CPSET':>7} {'CPRNG':>8} "
+          f"{'T1DIST':>8} {'T1':>9} {'T2':>9} {'T3':>9}")
+    print("  " + "-" * 134)
     counts = defaultdict(int)
     for sym, res, err in rows_out:
         if err:
@@ -341,16 +457,26 @@ def main() -> int:
         entry = f"{res['entry']:.2f}" if res["entry"] is not None else "-"
         mh = f"{res['mh']:.2f}" if res["mh"] is not None else "-"
         ml = f"{res['ml']:.2f}" if res["ml"] is not None else "-"
-        rng = (f"{res['mh'] - res['ml']:.2f}"
-               if res["mh"] is not None and res["ml"] is not None else "-")
+        rng = f"{res['own_range']:.2f}" if res["own_range"] is not None else "-"
+        cpset = res.get("cp_setup") or "-"
+        cprng = f"{res['cp_range']:.2f}" if res["cp_range"] is not None else "-"
+        t1d = f"{res['t1_dist']:.2f}" if res["t1_dist"] is not None else "-"
+        t1 = f"{res['t1_price']:.2f}" if res["t1_price"] is not None else "-"
+        t2 = f"{res['t2_price']:.2f}" if res.get("t2_price") is not None else "-"
+        t3 = f"{res['t3_price']:.2f}" if res.get("t3_price") is not None else "-"
         counts[res["verdict"].rstrip("*")] += 1
         print(f"  {sym:<22} {res['verdict']:<9} {res['direction']:<13} {entry:>9} "
-              f"{mh:>9} {ml:>9} {rng:>8}")
-    print("  " + "-" * 84)
+              f"{mh:>9} {ml:>9} {rng:>8} {cpset:>7} {cprng:>8} {t1d:>8} {t1:>9} "
+              f"{t2:>9} {t3:>9}")
+    print("  " + "-" * 134)
     print("  totals: "
           + (", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none"))
     print("  (* = breakout confirmed but entry candle not formed yet; "
-          "RANGE = MH-ML in points)")
+          "RANGE = own MH-ML)")
+    print("  (CPSET = counterpart leg's setup; CPRNG = its range. T1 only when "
+          "BOTH legs are T1 + same direction, else HOLD.)")
+    print("  (T1DIST = min(RANGE,CPRNG)/2; T1 = entry +/- T1DIST. T2=T1+/-5, "
+          "T3=T2+/-5, each set only if price kept running past the prior target.)")
     return 0
 
 

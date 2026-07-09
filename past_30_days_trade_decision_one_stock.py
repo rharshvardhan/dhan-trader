@@ -103,7 +103,7 @@ def run_backtest(symbol: str, rows, interval_min: int):
             strat.on_candle(cd)
         if strat.setup and strat.entry_price is not None:
             results.append((day, strat.setup, strat.direction, strat.entry_price))
-        elif strat.setup and strat.state == State.AWAIT_ENTRY:
+        elif strat.setup and strat.state in (State.AWAIT_ENTRY, State.AWAIT_T2_ENTRY):
             results.append((day, strat.setup + " (signal, no entry candle in data)",
                             strat.direction, None))
         else:
